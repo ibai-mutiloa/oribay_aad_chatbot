@@ -1,0 +1,40 @@
+[
+  {
+    "scenario": "historico_objetivo_oee_con_trazabilidad",
+    "steps": [
+      {
+        "prompt": "A nivel histórico, ¿qué pieza de alto volumen nos reportaría más beneficio si mejorara su OEE?",
+        "must_match": ["artículo|pieza", "OEE", "piezas", "€|euros", "Cómo se ha calculado"],
+        "max_seconds": 30
+      },
+      {
+        "prompt": "Para esa pieza, ¿cuánto podríamos ahorrar si subimos su OEE al 65 %?",
+        "must_match": ["65[,.]00|65 ?%", "ahorro estimado", "histórico", "Cómo se ha calculado", "estimación"],
+        "must_not_match": ["31 de mayo", "2026-05-31", "3[.]?276 piezas", "83[,.]24"],
+        "max_seconds": 30
+      },
+      {
+        "prompt": "¿Qué alcance has mantenido para ese cálculo?",
+        "must_match": ["He mantenido", "histórico", "220SDNRW3BGT"],
+        "must_not_match": ["31 de mayo", "2026-05-31"],
+        "max_seconds": 15
+      }
+    ]
+  },
+  {
+    "scenario": "fecha_explicita_no_inventada",
+    "steps": [
+      {
+        "prompt": "¿Cuál fue el OEE de RB6 el 4 de septiembre de 2026?",
+        "must_match": ["RB6", "29[,.]25", "Cómo se ha calculado", "2026-09-04|4 de septiembre"],
+        "max_seconds": 30
+      },
+      {
+        "prompt": "Dame más detalles sin cambiar el periodo.",
+        "must_match": ["RB6", "29[,.]25", "Cómo se ha calculado"],
+        "must_not_match": ["31 de mayo", "2026-05-31"],
+        "max_seconds": 30
+      }
+    ]
+  }
+]

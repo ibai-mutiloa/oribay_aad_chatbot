@@ -1,0 +1,19 @@
+[
+  {
+    "scenario": "ultimo_trimestre_determinista",
+    "steps": [
+      {
+        "prompt": "En el último trimestre, ¿qué artículos tuvieron más volumen de fabricación?",
+        "must_match": ["artículo|artículos", "piezas", "2026-04-01|1 de abril", "2026-06-30|30 de junio", "Cómo se ha calculado"],
+        "must_not_match": ["todos los datos disponibles"],
+        "max_seconds": 30
+      },
+      {
+        "prompt": "¿Qué fechas has usado para el último trimestre?",
+        "must_match": ["2026-04-01|1 de abril", "2026-06-30|30 de junio|30 de junio de 2026"],
+        "must_not_match": ["No puedo resolver", "datos autorizados"],
+        "max_seconds": 15
+      }
+    ]
+  }
+]

@@ -1,0 +1,31 @@
+[
+  {
+    "scenario": "cambio_contexto_y_pregunta_abierta",
+    "steps": [
+      {
+        "prompt": "En 2026 qué referencias han dejado más piezas para rehacer?",
+        "must_match": ["piezas", "reoper|rehacer|retrab"],
+        "must_not_match": ["datos autorizados|vistas autorizadas|revisa los permisos"],
+        "max_seconds": 30
+      },
+      {
+        "prompt": "enséñame solo las que empiezan por 220",
+        "must_match": ["220", "empiezan|prefijo"],
+        "must_not_match": ["artículo 220SDNRW3BGT;"],
+        "max_seconds": 30
+      },
+      {
+        "prompt": "Mirando agosto, ¿qué es lo que más nos debería preocupar de los robots?",
+        "must_match": ["RB", "%|€|paradas|incidencias|minutos", "2026-08-01.*2026-08-31|agosto"],
+        "must_not_match": ["no he podido completar|datos autorizados|vistas autorizadas"],
+        "max_seconds": 40
+      },
+      {
+        "prompt": "Qué equipos van más apretados la semana que entra?",
+        "must_match": ["RB", "turnos|carga|desviación", "2026-38|semana 38|2026-39|semana 39"],
+        "must_not_match": ["artículo 220|articulo 220|datos autorizados|vistas autorizadas"],
+        "max_seconds": 30
+      }
+    ]
+  }
+]

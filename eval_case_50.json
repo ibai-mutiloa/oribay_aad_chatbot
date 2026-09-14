@@ -1,0 +1,102 @@
+[
+  {
+    "scenario": "oee_basico_semana_22",
+    "steps": [
+      {"prompt": "Dame Calidad, Disponibilidad, Rendimiento y OEE de RB4 en la semana 2026-22.", "must_match": ["99[,.]98", "83[,.]65", "65[,.]18", "54[,.]51"], "max_seconds": 30},
+      {"prompt": "Dame solamente el OEE de RB4 en esa semana.", "must_match": ["54[,.]51", "OEE"], "max_seconds": 30},
+      {"prompt": "¿Cuál fue la peor máquina en rendimiento?", "must_match": ["RB7", "29[,.]48"], "max_seconds": 30},
+      {"prompt": "¿Y la segunda peor?", "must_match": ["RB3", "34[,.]14"], "max_seconds": 30},
+      {"prompt": "¿Qué máquina tuvo el mejor OEE?", "must_match": ["RB9", "63[,.]56"], "max_seconds": 30}
+    ]
+  },
+  {
+    "scenario": "oee_globales_y_perdidas",
+    "steps": [
+      {"prompt": "En lo que llevamos de 2026, ¿cuál es la pérdida económica total del OEE?", "must_match": ["pérdida", "[0-9][0-9.,]+", "€|euros"], "max_seconds": 30},
+      {"prompt": "¿Cuál es la pérdida por inactividad?", "must_match": ["inactividad", "[0-9][0-9.,]+", "€|euros"], "max_seconds": 30},
+      {"prompt": "¿Cuál es la pérdida por rendimiento?", "must_match": ["rendimiento", "[0-9][0-9.,]+", "€|euros"], "max_seconds": 30},
+      {"prompt": "¿Cuál es la tasa de rechazo en RB4 en 2026-22?", "must_match": ["0[,.]0|0[,.]02|99[,.]98", "%|rechazo|calidad"], "max_seconds": 30},
+      {"prompt": "¿Cuántas piezas desviadas hubo en 2026?", "must_match": ["-.*[0-9]", "piezas desviadas"], "max_seconds": 30}
+    ]
+  },
+  {
+    "scenario": "oee_articulo_maquina",
+    "steps": [
+      {"prompt": "¿Cuántas piezas se produjeron de 24DMRUB0D06 en RB8 en la semana 2026-33?", "must_match": ["47[.]?579|47579", "RB8"], "max_seconds": 30},
+      {"prompt": "¿Qué OEE tuvo esa combinación?", "must_match": ["51[,.]63", "OEE"], "max_seconds": 30},
+      {"prompt": "¿Cuál fue la pérdida económica del OEE de esa combinación?", "must_match": ["1[.]?353[,.]87|1353[,.]87", "€|euros"], "max_seconds": 30},
+      {"prompt": "¿Qué artículo tuvo más piezas producidas en 2026?", "must_match": ["AC032AB0D06", "piezas"], "max_seconds": 30},
+      {"prompt": "Compara AC032AB0D06 entre RB6 y RB7.", "must_match": ["RB6", "RB7", "%", "piezas"], "max_seconds": 30}
+    ]
+  },
+  {
+    "scenario": "paradas_rb4_35",
+    "steps": [
+      {"prompt": "¿Cuántas paradas tuvo RB4 en la semana 2026-35?", "must_match": ["6", "paradas"], "max_seconds": 30},
+      {"prompt": "¿Cuántos minutos acumuló esa máquina?", "must_match": ["500", "minutos"], "max_seconds": 30},
+      {"prompt": "¿Cuántas fueron no planificadas y cuántas planificadas?", "must_match": ["4.*no planificadas", "2.*planificadas"], "max_seconds": 30},
+      {"prompt": "¿Cuáles fueron las cinco paradas OEE más largas?", "must_match": ["138", "95", "60", "57", "4 paradas"], "max_seconds": 30},
+      {"prompt": "Compara las paradas por turno.", "must_match": ["Mañana.*2.*185", "Tarde.*3.*177", "Noche.*1.*138"], "max_seconds": 30}
+    ]
+  },
+  {
+    "scenario": "paradas_globales_y_fechas",
+    "steps": [
+      {"prompt": "Dame un resumen de los tiempos muertos de la semana pasada.", "must_match": ["RB10", "RB11", "RB4", "RB5", "RB8", "RB9"], "max_seconds": 30},
+      {"prompt": "Dame los cinco tiempos muertos más largos de la semana pasada.", "must_match": ["4[.]?658", "1[.]?751", "1[.]?505", "1[.]?272", "1[.]?046", "RB4"], "max_seconds": 30},
+      {"prompt": "¿Qué OEE tuvo RB6 el viernes pasado?", "must_match": ["RB6", "4 de septiembre|2026-09-04", "29[,.]25"], "max_seconds": 30},
+      {"prompt": "¿Qué Calidad, Disponibilidad y Rendimiento tuvo ese día?", "must_match": ["99[,.]40", "44[,.]40", "66[,.]28"], "max_seconds": 30},
+      {"prompt": "¿Qué robots tuvieron paradas ayer?", "must_match": ["paradas|resultados|no encontr"], "max_seconds": 30}
+    ]
+  },
+  {
+    "scenario": "ranking_robots_33",
+    "steps": [
+      {"prompt": "En la semana 2026-33, compara el OEE de todos los robots.", "must_match": ["RB11", "80[,.]29", "RB4", "30[,.]48"], "max_seconds": 30},
+      {"prompt": "¿Cuál tuvo el peor OEE?", "must_match": ["RB4", "30[,.]48"], "max_seconds": 30},
+      {"prompt": "¿Y el segundo peor?", "must_match": ["RB3", "38[,.]80"], "max_seconds": 30},
+      {"prompt": "¿Cuál fue la pérdida económica del segundo?", "must_match": ["RB3", "1[.]?152[,.]76", "€|euros"], "max_seconds": 30},
+      {"prompt": "¿Qué robot tuvo el mejor rendimiento en esa semana?", "must_match": ["RB11", "98[,.]59|rendimiento"], "max_seconds": 30}
+    ]
+  },
+  {
+    "scenario": "planificador_cartera_38_39",
+    "steps": [
+      {"prompt": "¿Cómo está la cartera de OF para s38 y s39?", "must_match": ["38", "39", "RB", "pendientes|unidades"], "max_seconds": 30},
+      {"prompt": "¿Qué equipos están más saturados esas semanas?", "must_match": ["RB7|RB8|RB5|RB12", "desviación|turnos|horas"], "max_seconds": 30},
+      {"prompt": "¿Qué robot tiene más carga pendiente en la semana 37?", "must_match": ["RB[0-9]+", "[0-9][0-9.]+", "unidades"], "max_seconds": 30},
+      {"prompt": "¿Qué robot tiene mayor desviación de horas en la semana 37?", "must_match": ["RB[0-9]+", "[0-9][0-9,.]+", "horas"], "max_seconds": 30},
+      {"prompt": "¿Qué cargas podrían redistribuirse de RB12 a otros robots?", "must_match": ["desactivada|no propondré|vista específica"], "max_seconds": 10}
+    ]
+  },
+  {
+    "scenario": "planificador_detalle_y_sinonimos",
+    "steps": [
+      {"prompt": "¿Qué órdenes de fabricación pendientes tiene RB7 en s38?", "must_match": ["RB7", "38", "pendientes|órdenes|unidades"], "max_seconds": 30},
+      {"prompt": "¿Qué carga de trabajo tiene cada equipo en la semana 39?", "must_match": ["39", "RB", "carga|unidades|horas"], "max_seconds": 30},
+      {"prompt": "¿Qué robots están sobrecargados según el plan?", "must_match": ["RB", "desviación|turnos|horas"], "max_seconds": 30},
+      {"prompt": "¿Qué referencias tienen más cantidad pendiente?", "must_match": ["artículo|referencia|pendiente|unidades"], "max_seconds": 30},
+      {"prompt": "¿Qué OF tienen fecha de necesidad en la semana 38?", "must_match": ["38", "PEV|OF|órdenes"], "max_seconds": 30}
+    ]
+  },
+  {
+    "scenario": "conversaciones_y_alcance",
+    "steps": [
+      {"prompt": "Hola", "must_match": ["OEE", "paradas"], "max_seconds": 10},
+      {"prompt": "¿Para qué sirves?", "must_match": ["OEE", "producción|paradas"], "max_seconds": 10},
+      {"prompt": "¿Qué datos estás utilizando?", "must_match": ["vw_oee_master|OEE|paradas|planificador"], "max_seconds": 10},
+      {"prompt": "¿Estás utilizando solamente datos de 2026?", "must_match": ["2026"], "max_seconds": 10},
+      {"prompt": "Reiniciar memoria", "must_match": ["borrado|contexto|memoria"], "max_seconds": 10}
+    ]
+  },
+  {
+    "scenario": "validaciones_y_consultas_combinadas",
+    "steps": [
+      {"prompt": "¿Qué OEE tuvo RB6 el 25 de septiembre de 2026?", "must_match": ["futura|aún|todavía|25 de septiembre|2026-09-25"], "max_seconds": 10},
+      {"prompt": "¿Qué calidad tuvo RB6 el 4 de septiembre de 2026?", "must_match": ["99[,.]40", "%|calidad"], "max_seconds": 30},
+      {"prompt": "¿Cuál es la máquina con peor rendimiento en 2026-22?", "must_match": ["RB7", "29[,.]48"], "max_seconds": 30},
+      {"prompt": "¿Cuántos puntos separan a RB4 de RB7?", "must_match": ["35[,.]70", "puntos"], "max_seconds": 30},
+      {"prompt": "¿Cuál es el mejor OEE de esa semana?", "must_match": ["RB9", "63[,.]56"], "max_seconds": 30}
+    ]
+  }
+]

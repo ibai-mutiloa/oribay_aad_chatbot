@@ -1,0 +1,82 @@
+[
+  {
+    "scenario": "fechas_operario",
+    "steps": [
+      {
+        "prompt": "Cuánto hicimos el 10/septiembre?",
+        "must_match": ["10 de septiembre|2026-09-10", "piezas|producci"],
+        "must_not_match": ["datos autorizados|vistas autorizadas|revisa los permisos"],
+        "max_seconds": 30
+      },
+      {
+        "prompt": "y qué oee salió ese día?",
+        "must_match": ["OEE", "%"],
+        "must_not_match": ["datos autorizados|vistas autorizadas|revisa los permisos"],
+        "max_seconds": 30
+      },
+      {
+        "prompt": "compáralo con el día anterior",
+        "must_match": ["9 de septiembre|2026-09-09", "10 de septiembre|2026-09-10"],
+        "must_not_match": ["datos autorizados|vistas autorizadas|revisa los permisos"],
+        "max_seconds": 30
+      }
+    ]
+  },
+  {
+    "scenario": "lexico_produccion",
+    "steps": [
+      {
+        "prompt": "En 2026 qué referencias han dejado más piezas para rehacer?",
+        "must_match": ["reoper|retrab|rehacer", "piezas"],
+        "must_not_match": ["capacidad pendiente|órdenes pendientes|datos autorizados"],
+        "max_seconds": 30
+      },
+      {
+        "prompt": "enséñame solo las que empiezan por 220",
+        "must_match": ["220"],
+        "must_not_match": ["datos autorizados|vistas autorizadas|revisa los permisos"],
+        "max_seconds": 30
+      },
+      {
+        "prompt": "dame también su tiempo teórico real y el tiempo real",
+        "must_match": ["tiempo teórico real|teórico real", "tiempo real", "segundos"],
+        "must_not_match": ["datos autorizados|vistas autorizadas|revisa los permisos"],
+        "max_seconds": 30
+      }
+    ]
+  },
+  {
+    "scenario": "pregunta_abierta",
+    "steps": [
+      {
+        "prompt": "Mirando agosto de 2026, qué es lo que más nos debería preocupar de los robots?",
+        "must_match": ["RB", "%|€|paradas|pérdida"],
+        "must_not_match": ["datos autorizados|vistas autorizadas|revisa los permisos"],
+        "max_seconds": 40
+      },
+      {
+        "prompt": "explícame por qué has llegado a esa conclusión",
+        "must_match": ["porque|debido|explica|conclusión|resultado"],
+        "must_not_match": ["datos autorizados|vistas autorizadas|revisa los permisos"],
+        "max_seconds": 20
+      }
+    ]
+  },
+  {
+    "scenario": "lexico_planificacion",
+    "steps": [
+      {
+        "prompt": "Qué equipos van más apretados la semana que entra?",
+        "must_match": ["RB", "turnos|carga|desviación"],
+        "must_not_match": ["datos autorizados|vistas autorizadas|revisa los permisos"],
+        "max_seconds": 30
+      },
+      {
+        "prompt": "hay alguna propuesta ya calculada para aliviar alguno?",
+        "must_match": ["balanceo|mover|redistribu|sugerencia|No hay"],
+        "must_not_match": ["datos autorizados|vistas autorizadas|revisa los permisos"],
+        "max_seconds": 30
+      }
+    ]
+  }
+]

@@ -1,0 +1,80 @@
+[
+  {
+    "scenario": "ranking_sin_filtro_heredado",
+    "steps": [
+      {
+        "prompt": "Dame Calidad, Disponibilidad, Rendimiento y OEE de RB4 en la semana 2026-22.",
+        "must_match": ["RB4", "65[,.]18", "54[,.]51"],
+        "max_seconds": 30
+      },
+      {
+        "prompt": "¿Cuál fue la peor máquina en rendimiento?",
+        "must_match": ["RB7", "rendimiento"],
+        "must_not_match": ["RB4 tuvo un rendimiento|OEE del 22"],
+        "max_seconds": 30
+      },
+      {
+        "prompt": "¿Cuántos puntos separan a RB4 de RB7?",
+        "must_match": ["puntos porcentuales", "RB4", "RB7"],
+        "must_not_match": ["diferencia de OEE"],
+        "max_seconds": 30
+      }
+    ]
+  },
+  {
+    "scenario": "fecha_relativa_determinista",
+    "steps": [
+      {
+        "prompt": "¿Qué OEE tuvo RB6 el viernes pasado?",
+        "must_match": ["11 de septiembre|2026-09-11|no se encontraron datos"],
+        "must_not_match": ["2026-09-12|12 de septiembre"],
+        "max_seconds": 30
+      },
+      {
+        "prompt": "¿Qué fecha exacta has utilizado?",
+        "must_match": ["2026-09-11"],
+        "must_not_match": ["2026-09-12"],
+        "max_seconds": 15
+      }
+    ]
+  },
+  {
+    "scenario": "trazabilidad_global_limpia",
+    "steps": [
+      {
+        "prompt": "¿Qué carga de trabajo tiene RB5 en la semana 39?",
+        "must_match": ["RB5", "semana 39|2026-39"],
+        "max_seconds": 30
+      },
+      {
+        "prompt": "¿Qué robots están sobrecargados según el plan?",
+        "must_match": ["RB", "turnos|carga|desviación"],
+        "must_not_match": ["Cómo se ha calculado:.*máquina RB5"],
+        "max_seconds": 30
+      },
+      {
+        "prompt": "¿Qué referencias tienen más cantidad pendiente?",
+        "must_match": ["piezas pendientes", "referencias|artículo"],
+        "must_not_match": ["Cómo se ha calculado:.*máquina RB"],
+        "max_seconds": 30
+      }
+    ]
+  },
+  {
+    "scenario": "balanceo_datos_dinamicos",
+    "steps": [
+      {
+        "prompt": "¿Qué sugerencias de balanceo hay para la semana 37?",
+        "must_match": ["RB12", "piezas", "turnos", "destino"],
+        "must_not_match": ["datos autorizados|revisa los permisos"],
+        "max_seconds": 30
+      },
+      {
+        "prompt": "Explícame el impacto de esa sugerencia sin asumir que ya se ha aplicado.",
+        "must_match": ["liberar", "turnos", "destino"],
+        "must_not_match": ["ya se ha ejecutado|ha modificado el plan"],
+        "max_seconds": 30
+      }
+    ]
+  }
+]
