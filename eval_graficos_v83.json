@@ -1,0 +1,30 @@
+[
+  {
+    "scenario": "grafico_oee_robots_v83",
+    "steps": [
+      {
+        "prompt": "Compara el OEE de todos los robots en la semana 2026-33 y genera un gráfico.",
+        "must_match": ["Gráfico", "OEE", "RB11", "RB4", "█"],
+        "must_not_match": ["█{21}", "no puedo|no he podido|permisos"],
+        "max_seconds": 30
+      },
+      {
+        "prompt": "Ahora represéntame gráficamente su producción en esa misma semana.",
+        "must_match": ["Gráfico", "Producción|piezas", "RB", "█"],
+        "must_not_match": ["█{21}", "Gráfico[\\s\\S]*Gráfico", "no puedo|no he podido|permisos"],
+        "max_seconds": 30
+      }
+    ]
+  },
+  {
+    "scenario": "grafico_capacidad_v83",
+    "steps": [
+      {
+        "prompt": "Muéstrame con un gráfico qué robots tienen más cantidad pendiente en la semana 2026-39.",
+        "must_match": ["Gráfico", "Cantidad pendiente", "RB5\\s*\\|", "piezas", "█"],
+        "must_not_match": ["█{21}", "\\n39\\s*\\|", "no puedo|no he podido|permisos"],
+        "max_seconds": 30
+      }
+    ]
+  }
+]

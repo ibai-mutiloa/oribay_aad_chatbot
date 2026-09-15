@@ -10,7 +10,22 @@ Las sugerencias de balanceo se interpretan sobre una capacidad de 15 turnos sema
 El asistente distingue entre los turnos liberados en el origen y los turnos ajustados por OEE que
 necesita el destino, por lo que no confunde una solución de capacidad con una mejora de eficiencia.
 
-La versión v79 añade una interpretación semántica previa en lenguaje natural para tolerar el
+La versión v83 añade gráficos de barras en texto monoespaciado para comparaciones y rankings
+solicitados expresamente por el usuario. Los gráficos se construyen de manera determinista a partir
+de las filas devueltas por BigQuery y no introducen cálculos ni datos generados por el modelo.
+Actualmente cubren OEE, Calidad, Disponibilidad, Rendimiento, producción, pérdidas, carga pendiente,
+desviación de turnos y duración de paradas, sin necesitar almacenamiento ni permisos adicionales.
+La redacción generativa no dibuja gráficos: Python añade exactamente uno, con título y valores
+procedentes de BigQuery. Las comparaciones gráficas de cantidad pendiente se enrutan desde la
+pregunta original hacia el planificador de capacidad para que la reformulación semántica no pierda
+esa intención.
+
+Antes de renderizar, se elimina cualquier bloque gráfico que el modelo haya podido generar. El
+renderizador aplica un ancho máximo fijo de 20 caracteres, ordena los rankings por valor y solo usa
+una dimensión temporal cuando existen varios periodos distintos; en una semana concreta etiqueta
+las barras por robot.
+
+La versión también conserva la interpretación semántica previa en lenguaje natural para tolerar el
 vocabulario libre de los operarios, errores, abreviaturas, fechas informales y preguntas abiertas.
 La pregunta original se conserva para la conversación y la reformulación se utiliza únicamente
 para construir una consulta segura. Si la primera interpretación no se puede consultar, se realiza

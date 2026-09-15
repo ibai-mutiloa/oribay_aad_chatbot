@@ -280,7 +280,7 @@ _schema_cache: tuple[float, str, set[str]] | None = None
 SCHEMA_CACHE_SECONDS = int(os.getenv("SCHEMA_CACHE_SECONDS", "600"))
 MEMORY_COLLECTION = os.getenv("MEMORY_COLLECTION", "chatbot_aad_conversations")
 MAX_MEMORY_TURNS = int(os.getenv("MAX_MEMORY_TURNS", "8"))
-APP_VERSION = "v79"
+APP_VERSION = "v83"
 ENABLE_PROGRESS_MESSAGE = os.getenv("ENABLE_PROGRESS_MESSAGE", "true").lower() in {
     "1", "true", "yes", "si", "sí"
 }
@@ -1815,7 +1815,13 @@ def deterministic_planner_week_load_sql(
         r"\b(?:saturacion|sobrecarga|saturados?|sobrecargados?|mas cargados?)\b",
         normalized,
     ))
-    if not (asks_pending_load or asks_turn_deviation or asks_hour_deviation or asks_saturation):
+    if not (
+        asks_pending_load
+        or asks_quantity_ranking
+        or asks_turn_deviation
+        or asks_hour_deviation
+        or asks_saturation
+    ):
         return None
     weeks = planner_context_weeks(question, history)
     # If no week is stated, allow a plant-wide current-year workload ranking.
@@ -3018,6 +3024,9 @@ Reglas:
 - Los campos *_eur se muestran en euros con dos decimales. El resto de cifras usa como máximo dos decimales salvo que el detalle sea necesario.
 - Usa formato numérico español: coma decimal y punto de miles cuando corresponda.
 - Un valor negativo de piezas_desviadas significa producción por debajo del teórico; uno positivo significa producción por encima del teórico.
+- Aunque el usuario solicite un gráfico, no dibujes barras, tablas ASCII ni bloques de código en
+  esta respuesta. Redacta únicamente la explicación textual: Python añadirá después un único
+  gráfico determinista construido con los resultados de BigQuery.
 
 Pregunta: {question}
 Historial reciente: {json.dumps(history, ensure_ascii=False)}
@@ -3224,6 +3233,163 @@ def deterministic_high_volume_opportunity_answer(
     return answer
 
 
+def append_text_chart(answer: str, question: str, rows: list[dict]) -> str:
+    """Append a deterministic monospaced bar chart when the user asks for a graph."""
+    normalized = normalized_business_text(question)
+    if not rows or not re.search(
+        r"\b(?:grafico|grafica|visualiza|representa|dibuja|diagrama|barras?)\w*\b",
+        normalized,
+    ):
+        return answer
+
+    # The model can ignore the formatting instruction and emit an unsafe chart.
+    # Remove any such block and rebuild it below with a fixed width.
+    if "█" in answer or "░" in answer:
+        answer = re.sub(
+            r"\n*\*?Gr[aá]fic[oa][^\n]*\*?\s*\n```[\s\S]*?(?:```|\Z)",
+            "",
+            answer,
+            flags=re.IGNORECASE,
+        ).rstrip()
+        answer = re.sub(
+            r"\n*```(?=[\s\S]*[█░])[\s\S]*?(?:```|\Z)",
+            "",
+            answer,
+            flags=re.IGNORECASE,
+        ).rstrip()
+
+    metric_specs = [
+        (r"\boee\b", ("oee_pct",), "OEE", "%", True),
+        (r"\brendimiento\b", ("rendimiento_pct",), "Rendimiento", "%", True),
+        (r"\bdisponibilidad\b", ("disponibilidad_pct",), "Disponibilidad", "%", True),
+        (r"\bcalidad\b", ("calidad_pct",), "Calidad", "%", True),
+        (
+            r"\b(?:perdida|coste|euros?)\b",
+            ("perdida_oee_eur", "perdida_total_eur", "perdida_eur"),
+            "Pérdida OEE",
+            "€",
+            False,
+        ),
+        (
+            r"\b(?:cantidad|carga)\s+pendiente\b|\bpendientes?\b",
+            ("cantidad_pendiente",),
+            "Cantidad pendiente",
+            "piezas",
+            False,
+        ),
+        (
+            r"\bdesviacion\b.*\bturnos?\b|\bturnos?\b.*\bdesviacion\b",
+            ("turnos_desviacion",),
+            "Desviación de turnos",
+            "turnos",
+            False,
+        ),
+        (
+            r"\b(?:paradas?|tiempos?\s+muertos?)\b",
+            ("tiempo_parada_min", "minutos_parada", "duracion_minutos", "total_minutos"),
+            "Tiempo de parada",
+            "min",
+            False,
+        ),
+        (
+            r"\b(?:produccion|piezas?|volumen)\b",
+            ("total_piezas_producidas", "piezas_producidas", "cantidad_producida", "buenas"),
+            "Producción",
+            "piezas",
+            False,
+        ),
+    ]
+    fallback_metrics = [
+        (("oee_pct",), "OEE", "%", True),
+        (("total_piezas_producidas", "piezas_producidas"), "Producción", "piezas", False),
+        (("cantidad_pendiente",), "Cantidad pendiente", "piezas", False),
+        (("turnos_desviacion",), "Desviación de turnos", "turnos", False),
+        (("perdida_oee_eur",), "Pérdida OEE", "€", False),
+        (("tiempo_parada_min", "minutos_parada"), "Tiempo de parada", "min", False),
+    ]
+
+    metric_key = None
+    metric_title = ""
+    unit = ""
+    is_percentage = False
+    for pattern, candidates, title, candidate_unit, percentage in metric_specs:
+        if re.search(pattern, normalized):
+            metric_key = next(
+                (key for key in candidates if any(row.get(key) is not None for row in rows)),
+                None,
+            )
+            if metric_key:
+                metric_title, unit, is_percentage = title, candidate_unit, percentage
+                break
+    if metric_key is None:
+        for candidates, title, candidate_unit, percentage in fallback_metrics:
+            metric_key = next(
+                (key for key in candidates if any(row.get(key) is not None for row in rows)),
+                None,
+            )
+            if metric_key:
+                metric_title, unit, is_percentage = title, candidate_unit, percentage
+                break
+    if metric_key is None:
+        return answer
+
+    temporal_request = bool(re.search(r"\b(?:evolucion|tendencia|serie\s+temporal)\w*\b", normalized))
+    temporal_labels = ("periodo", "mes", "fecha", "semana", "semana_necesidad")
+    entity_labels = (
+        "maquina", "articulo", "tipo_incidencia", "turno", "cliente",
+        "origen", "maquina_origen", "destino_recomendado",
+    )
+    label_candidates = temporal_labels + entity_labels if temporal_request else entity_labels + temporal_labels
+    label_key = next(
+        (
+            key for key in label_candidates
+            if len({str(row.get(key)) for row in rows if row.get(key) not in (None, "")}) >= 2
+        ),
+        None,
+    )
+    if label_key is None:
+        return answer
+
+    points = []
+    for row in rows:
+        label = row.get(label_key)
+        raw_value = row.get(metric_key)
+        if label in (None, "") or raw_value is None:
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        display_value = value * 100 if is_percentage else value
+        points.append((str(label), display_value))
+    if len(points) < 2:
+        return answer
+
+    if not temporal_request:
+        points.sort(key=lambda point: point[1], reverse=True)
+    points = points[:15]
+    scale_max = 100.0 if is_percentage else max(abs(value) for _, value in points)
+    if scale_max <= 0:
+        return answer
+
+    bar_width = 20
+    label_width = min(max(len(label) for label, _ in points), 22)
+    chart_lines = []
+    for label, value in points:
+        blocks = max(0, min(bar_width, round(abs(value) / scale_max * bar_width)))
+        bar = "█" * blocks + "░" * (bar_width - blocks)
+        short_label = label if len(label) <= label_width else label[: label_width - 1] + "…"
+        decimals = 0 if unit == "piezas" and abs(value) >= 100 else 2
+        value_text = spanish_number(value, decimals)
+        chart_lines.append(f"{short_label:<{label_width}} | {bar} {value_text} {unit}")
+
+    chart = (
+        f"\n\n*Gráfico — {metric_title}*\n"
+        "```\n" + "\n".join(chart_lines) + "\n```"
+    )
+    return answer.rstrip() + chart
+
+
 def append_calculation_trace(
     answer: str,
     question: str,
@@ -3388,7 +3554,17 @@ def chat_event():
                 "por lo que aún no puede haber datos de producción ni de paradas para ese día."
             )
 
-        sql = make_sql(analytical_question, schema, history)
+        # Graph requests for pending capacity are routed from the original wording.
+        # This prevents the semantic rewrite from losing the planner intent.
+        original_chart_planner_sql = None
+        if re.search(
+            r"\b(?:grafico|grafica|visualiza|representa|dibuja|diagrama|barras?)\w*\b",
+            normalized_business_text(question),
+        ):
+            original_chart_planner_sql = deterministic_planner_week_load_sql(question, history)
+        sql = original_chart_planner_sql or make_sql(analytical_question, schema, history)
+        if original_chart_planner_sql:
+            logging.info("Consulta gráfica de capacidad enrutada desde la pregunta original")
         if sql == "NO_SE_PUEDE":
             second_question = semantic_rewrite_question(
                 question,
@@ -3444,6 +3620,7 @@ def chat_event():
             answer = deterministic_planner_answer(analytical_question, rows)
         if answer is None:
             answer = explain(question, rows, history, sql)
+        answer = append_text_chart(answer, question, rows)
         answer = append_calculation_trace(answer, analytical_question, rows, sql, history)
         return remembered_response(answer)
     except RuntimeError as error:

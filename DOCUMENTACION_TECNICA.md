@@ -2,7 +2,7 @@
 
 ## 1. Propósito y alcance
 
-Aplicación interna que recibe preguntas en español desde Google Chat, genera consultas GoogleSQL de solo lectura y devuelve respuestas sobre OEE, producción y paradas.
+Aplicación interna que recibe preguntas en español desde Google Chat, genera consultas GoogleSQL de solo lectura y devuelve respuestas sobre OEE, producción, paradas y planificación. Cuando el usuario lo solicita, añade un gráfico de barras en texto construido directamente con los resultados de BigQuery.
 
 El chatbot consulta exclusivamente:
 
@@ -95,7 +95,8 @@ sqlglot==27.14.0
 10. `business_sql_error()` valida fórmulas y semántica.
 11. `execute_query()` hace dry-run, controla bytes y ejecuta BigQuery.
 12. `explain()` redacta la respuesta usando únicamente los resultados.
-13. `google_chat_text()` adapta Markdown al formato de Google Chat.
+13. `append_text_chart()` crea, cuando se solicita, un gráfico determinista en texto monoespaciado.
+14. `google_chat_text()` adapta Markdown al formato de Google Chat.
 14. Se actualiza el mensaje provisional y se guarda el turno.
 
 ## 7. Funciones clave
