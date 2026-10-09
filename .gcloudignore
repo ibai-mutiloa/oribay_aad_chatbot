@@ -1,0 +1,16 @@
+.git/
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+tests/
+*.md
+pytest.ini
+package.json
+package-lock.json
+integration_eval_v83.py
+integration_scenarios_v83.json
+eval_*.json
+run_eval.py
+
+.pytest_cache/

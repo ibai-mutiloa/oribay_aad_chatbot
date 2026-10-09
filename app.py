@@ -278,6 +278,7 @@ Patrón obligatorio para "top N paradas/incidencias más largas":
 
 _schema_cache: tuple[float, str, set[str]] | None = None
 SCHEMA_CACHE_SECONDS = int(os.getenv("SCHEMA_CACHE_SECONDS", "600"))
+FIRESTORE_DATABASE = os.getenv("FIRESTORE_DATABASE", "(default)")
 MEMORY_COLLECTION = os.getenv("MEMORY_COLLECTION", "chatbot_aad_conversations")
 MAX_MEMORY_TURNS = int(os.getenv("MAX_MEMORY_TURNS", "8"))
 APP_VERSION = "v83"
@@ -310,7 +311,11 @@ chat_credentials, _ = google.auth.default(
     scopes=["https://www.googleapis.com/auth/chat.bot"]
 )
 bq = bigquery.Client(project=PROJECT_ID, credentials=credentials)
-memory_db = firestore.Client(project=PROJECT_ID, credentials=credentials)
+memory_db = firestore.Client(
+    project=PROJECT_ID,
+    credentials=credentials,
+    database=FIRESTORE_DATABASE,
+)
 ai = genai.Client(
     vertexai=True,
     project=PROJECT_ID,
@@ -450,6 +455,50 @@ def resolve_temporal_context(text: str, today: date | None = None) -> dict[str, 
     current = today or datetime.now(MADRID_TZ).date()
     normalized = text.lower().strip()
     result: dict[str, str] = {}
+
+    date_range = re.search(
+        r"\b(?:(?:del|entre\s+el)\s+)?(\d{1,2})\s+(?:al\s+|y\s+(?:el\s+)?)"
+        r"(\d{1,2})\s+(?:de\s+)?"
+        r"(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|"
+        r"octubre|noviembre|diciembre)(?:\s+(?:de|del)?\s*(20\d{2}))?\b",
+        normalized,
+    )
+    if date_range:
+        start_day, end_day = int(date_range.group(1)), int(date_range.group(2))
+        month = SPANISH_MONTHS[date_range.group(3)]
+        year = int(date_range.group(4) or current.year)
+        try:
+            start, end = date(year, month, start_day), date(year, month, end_day)
+        except ValueError:
+            result["error_fecha"] = "El intervalo indicado no es válido."
+            return result
+        if end < start:
+            result["error_fecha"] = "El intervalo indicado no es válido."
+            return result
+        result.update(fecha_desde=start.isoformat(), fecha_hasta=end.isoformat())
+        if start > current:
+            result["fecha_futura"] = "true"
+        return result
+
+    iso_range = re.search(
+        r"\b(20\d{2}-\d{2}-\d{2})\s+(?:a|al|hasta|y)\s+"
+        r"(20\d{2}-\d{2}-\d{2})\b",
+        normalized,
+    )
+    if iso_range:
+        try:
+            start = date.fromisoformat(iso_range.group(1))
+            end = date.fromisoformat(iso_range.group(2))
+        except ValueError:
+            result["error_fecha"] = "El intervalo indicado no es válido."
+            return result
+        if end < start:
+            result["error_fecha"] = "El intervalo indicado no es válido."
+            return result
+        result.update(fecha_desde=start.isoformat(), fecha_hasta=end.isoformat())
+        if start > current:
+            result["fecha_futura"] = "true"
+        return result
 
     explicit = re.search(
         r"\b(\d{1,2})(?:\s+de)?\s+"
@@ -677,6 +726,12 @@ def query_mode(question: str, history: list[dict[str, str]]) -> str:
         business_text,
     ):
         return "planificador"
+    asks_oee_component_breakdown = bool(
+        re.search(r"\b(?:disponibilidad|oee|calidad|rendimiento)\b", normalized)
+        and re.search(r"\b(?:desglos\w*|componentes?|descompon\w*|calculo)\b", normalized)
+    )
+    if asks_oee_component_breakdown:
+        return "global"
     if re.search(
         r"\b(parada|paradas|incidencia|incidencias|averia|averias|tiempo muerto|"
         r"tiempos muertos|detencion|detenciones|interrupcion|interrupciones)\b",
@@ -709,6 +764,194 @@ def query_mode(question: str, history: list[dict[str, str]]) -> str:
     return "general"
 
 
+def _conversation_domain(question: str) -> str | None:
+    """Classify only the data domain needed to prevent cross-domain filter reuse."""
+    mode = query_mode(question, [])
+    normalized = lexical_intent_text(question)
+    if mode == "planificador":
+        return "planificador"
+    if re.search(r"\b(?:balanceo|redistribu|sugerencias? de balanceo)\b", normalized):
+        return "balanceo"
+    if mode == "paradas":
+        return "paradas"
+    if re.search(
+        r"\b(?:oee|ooe|calidad|disponibilidad|rendimiento|produccion|piezas?|"
+        r"reoperaciones?|perdida(?:s)? economica(?:s)?)\b",
+        normalized,
+    ):
+        return "oee"
+    return None
+
+
+def _reconcile_period_only_kpi_follow_up(
+    question: str, rewritten: str, history: list[dict[str, str]]
+) -> str:
+    """Preserve stated intent, and carry a single-machine KPI through a period-only turn."""
+    normalized = lexical_intent_text(question)
+    rewritten_normalized = lexical_intent_text(rewritten)
+    explicit_domain = _conversation_domain(question)
+    if explicit_domain and _conversation_domain(rewritten) != explicit_domain:
+        return question
+
+    explicit_metric_patterns = (
+        r"\b(?:oee|ooe)\b", r"\bcalidad\b", r"\bdisponibilidad\b",
+        r"\b(?:rendimiento|performance)\b", r"\bproducci[oó]n\b",
+    )
+    for pattern in explicit_metric_patterns:
+        if re.search(pattern, normalized) and not re.search(pattern, rewritten_normalized):
+            return question
+    explicit_machines = {
+        f"RB{match.group(1)}"
+        for match in re.finditer(r"\bRB\s*[-_ ]?\s*(\d+)\b", question, re.I)
+    }
+    rewritten_machines = {
+        f"RB{match.group(1)}"
+        for match in re.finditer(r"\bRB\s*[-_ ]?\s*(\d+)\b", rewritten, re.I)
+    }
+    has_explicit_article = bool(re.search(
+        r"\b(?:art[ií]culo|referencia|producto|pieza)\s+[A-Z0-9][A-Z0-9._-]{5,}\b",
+        question, re.I,
+    ))
+    machine_only_update = bool(explicit_machines) and not explicit_domain and not any(
+        re.search(pattern, normalized) for pattern in explicit_metric_patterns
+    ) and not has_explicit_article
+    if explicit_machines - rewritten_machines and not (machine_only_update and history):
+        return question
+
+    explicit_global = bool(re.search(
+        r"\b(?:todos|todas)\s+(?:los|las)\s+(?:robots?|m[aá]quinas?|equipos?)\b|"
+        r"\b(?:global(?:es)?|de\s+planta)\b",
+        normalized,
+    ))
+    rewritten_global = bool(re.search(
+        r"\b(?:todos|todas)\s+(?:los|las)\s+(?:robots?|m[aá]quinas?|equipos?)\b|"
+        r"\b(?:global(?:es)?|de\s+planta)\b",
+        rewritten_normalized,
+    ))
+    if explicit_global and not rewritten_global:
+        return question
+
+    if not history:
+        explicit_metrics = any(re.search(pattern, normalized) for pattern in explicit_metric_patterns)
+        rewritten_metrics = any(
+            re.search(pattern, rewritten_normalized) for pattern in explicit_metric_patterns
+        )
+        if rewritten_metrics and not explicit_metrics:
+            return question
+        if rewritten_machines - explicit_machines:
+            return question
+
+    has_period = bool(
+        re.search(r"\b20\d{2}\s*[-/]\s*\d{1,2}\b|\b(?:semana|s)\s*[-_ ]?\s*\d{1,2}\b", question, re.I)
+        or resolve_temporal_context(question).get("fecha_desde")
+    )
+    has_explicit_metric_or_domain = bool(
+        re.search(
+            r"\b(?:oee|ooe|calidad|disponibilidad|rendimiento|producci[oó]n|piezas?|"
+            r"paradas?|aver[ií]as?|balanceo|planificador|carga|ranking|comparar|compara)\b",
+            normalized,
+        )
+    )
+    broad_scope = bool(re.search(
+        r"\b(?:todos|todas)\s+(?:los|las)\s+(?:robots?|m[aá]quinas?|equipos?)\b|"
+        r"\b(?:global(?:es)?|de\s+planta)\b",
+        normalized,
+    ))
+    if (
+        not history or (not has_period and not machine_only_update)
+        or has_explicit_metric_or_domain or has_explicit_article
+        or broad_scope or _conversation_domain(question)
+    ):
+        return rewritten
+
+    domains = [_conversation_domain(str(turn.get("user", ""))) for turn in history]
+    last_domain = next((domain for domain in reversed(domains) if domain), None)
+    if last_domain != "oee":
+        return rewritten
+    last_other_domain = max(
+        (index for index, domain in enumerate(domains) if domain and domain != "oee"),
+        default=-1,
+    )
+    same_domain_history = history[last_other_domain + 1:]
+
+    metric_patterns = {
+        "Disponibilidad": r"\bdisponibilidad\b",
+        "Calidad": r"\bcalidad\b",
+        "Rendimiento": r"\b(?:rendimiento|performance)\b",
+        "OEE": r"\b(?:oee|ooe)\b",
+    }
+    metric = None
+    comparison_context = False
+    for turn in reversed(same_domain_history):
+        previous_question = lexical_intent_text(str(turn.get("user", "")))
+        matches = [label for label, pattern in metric_patterns.items() if re.search(pattern, previous_question)]
+        if matches:
+            # A multi-metric request has no single indicator to carry forward.
+            if len(matches) != 1:
+                return rewritten
+            if re.search(r"\b(?:ranking|mejor|peor|top)\b", previous_question):
+                return rewritten
+            metric = matches[0]
+            comparison_context = bool(re.search(
+                r"\b(?:compara\w*|comparaci[oó]n|entre|versus|vs\.?|diferencia)\b",
+                previous_question,
+            ))
+            break
+    if not metric:
+        return rewritten
+
+    filters = active_filters(question, history)
+    if filters.get("requiere_aclaracion") or filters.get("maquinas"):
+        if not comparison_context or filters.get("requiere_aclaracion"):
+            return rewritten
+    machine = filters.get("maquina")
+    comparison_machines = filters.get("maquinas", "").split(",")
+    if comparison_context:
+        if len(comparison_machines) < 2:
+            return rewritten
+    elif not machine:
+        return rewritten
+
+    parts = [metric]
+    if comparison_context:
+        parts = ["Comparar", metric, "de", " y ".join(comparison_machines)]
+    else:
+        parts.extend(["de la máquina", machine])
+    if filters.get("articulo"):
+        parts.extend(["del artículo", filters["articulo"]])
+    if filters.get("articulo_prefijo"):
+        parts.extend(["del artículo cuyo código empieza por", filters["articulo_prefijo"]])
+    if filters.get("semana"):
+        parts.extend(["en la semana", filters["semana"]])
+    elif filters.get("fecha_desde"):
+        start, end = filters["fecha_desde"], filters.get("fecha_hasta", filters["fecha_desde"])
+        parts.extend(["entre", start, "y", end])
+    elif filters.get("anio"):
+        parts.extend(["en el año", filters["anio"]])
+    else:
+        return rewritten
+    return " ".join(parts)
+
+
+def _ambiguous_machine_choice(question: str) -> tuple[str, ...]:
+    """Return alternatives when a machine choice is phrased as unresolved 'A or B'."""
+    machines = tuple(dict.fromkeys(
+        f"RB{match.group(1)}"
+        for match in re.finditer(r"\bRB\s*[-_ ]?\s*(\d+)\b", question, re.IGNORECASE)
+    ))
+    comparison = bool(re.search(
+        r"\b(?:compara\w*|comparaci[oó]n|entre|versus|vs\.?|diferencia|puntos? separan)\b",
+        normalized_business_text(question),
+    ))
+    if (
+        len(machines) > 1
+        and re.search(r"\b(?:o|u)\b", normalized_business_text(question))
+        and not comparison
+    ):
+        return machines
+    return ()
+
+
 def active_filters(question: str, history: list[dict[str, str]]) -> dict[str, str]:
     """Recover stable domain filters from the current and recent user turns."""
     current_normalized = normalized_business_text(question)
@@ -717,6 +960,18 @@ def active_filters(question: str, history: list[dict[str, str]]) -> dict[str, st
         or re.search(r"\b20\d{2}\s*[-/]\s*\d{1,2}\b", question)
         or re.search(r"\b(?:semana|s)\s*[-_/]?\s*\d{1,2}\b", question, re.IGNORECASE)
     )
+    annual_scope = bool(re.search(r"\b20\d{2}\b", current_normalized)) and not bool(
+        re.search(
+            r"\b(?:semana|s\s*[-_/]?\s*\d{1,2}|20\d{2}\s*[-/]\s*\d{1,2}|ayer|pasado|anterior)\b",
+            current_normalized,
+        )
+    )
+    explicit_historical_current = bool(re.search(
+        r"\b(?:historico|historica|historicamente|todo\s+el\s+historico|"
+        r"todos\s+los\s+datos|periodo\s+completo)\b",
+        current_normalized,
+    ))
+    current_period_explicit = explicit_current_scope or annual_scope or explicit_historical_current
     contextual_follow_up = bool(re.search(
         r"\b(?:ese|esa|eso|esos|esas|mismo|misma|anterior|antes|"
         r"comparalo|comparala|dame\s+detalles|por\s+que)\b",
@@ -735,28 +990,77 @@ def active_filters(question: str, history: list[dict[str, str]]) -> dict[str, st
             current_normalized,
         )
     )
-    # A complete new period is a scope boundary. Do not inherit a machine or
-    # article from an unrelated earlier analysis unless the user explicitly
-    # refers back to it.
-    if (explicit_current_scope and not contextual_follow_up) or broad_standalone_request:
-        history = []
-    # An explicit annual request starts a new scope. Do not inherit the last
-    # article, machine or week from the conversation (for example, after a
-    # question about RB8 in week 33 followed by "más piezas en 2026").
-    annual_scope = bool(re.search(r"\b20\d{2}\b", current_normalized)) and not bool(
-        re.search(r"\b(?:semana|s\s*[-_/]?\s*\d{1,2}|20\d{2}\s*[-/]\s*\d{1,2}|ayer|pasado|anterior)\b", current_normalized)
-    )
-    if annual_scope:
-        history = []
+    # Keep only the active analytical domain. Temporal changes are merged by
+    # dimension below instead of dropping the whole conversation scope.
+    current_domain = _conversation_domain(question)
+    domain_history = [
+        (index, _conversation_domain(str(turn.get("user", ""))))
+        for index, turn in enumerate(history)
+    ]
+    last_domain = next((domain for _, domain in reversed(domain_history) if domain), None)
+    if current_domain and last_domain and current_domain != last_domain:
+        normalized_question = lexical_intent_text(question)
+        contextual_oee_stop_explanation = bool(
+            current_domain == "paradas"
+            and last_domain == "oee"
+            and re.search(r"\b(?:por\s+que|explica\w*|causa\w*|motivo\w*)\b", normalized_question)
+            and re.search(r"\b(?:disponibilidad|oee|rendimiento|calidad|resultado|baja|bajo)\b", normalized_question)
+            and not explicit_historical_current
+        )
+        if contextual_oee_stop_explanation:
+            latest_oee_index = next(
+                index for index, domain in reversed(domain_history) if domain == "oee"
+            )
+            history = [history[latest_oee_index]]
+        else:
+            history = []
+    elif last_domain:
+        last_other_domain = max(
+            (index for index, domain in domain_history if domain and domain != last_domain),
+            default=-1,
+        )
+        history = history[last_other_domain + 1:]
+
+    explicit_global = bool(re.search(
+        r"\b(?:global(?:es)?|de\s+planta|todos\s+los\s+datos)\b",
+        current_normalized,
+    ))
+    clears_machine = explicit_global or bool(re.search(
+        r"\b(?:todos|todas)\s+(?:los|las)\s+(?:robots?|m[aá]quinas?|equipos?)\b",
+        current_normalized,
+    ))
+    clears_article = explicit_global or bool(re.search(
+        r"\b(?:todos|todas)\s+(?:los|las)\s+(?:art[ií]culos?|referencias?|piezas?)\b",
+        current_normalized,
+    ))
+    if broad_standalone_request:
+        clears_machine = clears_machine or bool(re.search(
+            r"\b(?:robots?|equipos?|m[aá]quinas?)\b", current_normalized
+        ))
+        clears_article = clears_article or bool(re.search(
+            r"\b(?:referencias?|art[ií]culos?|piezas?)\b", current_normalized
+        ))
     # Include assistant summaries when resolving elliptical follow-ups such as
     # “la pérdida del segundo”; the preceding ranked robot is often present
     # only in the assistant's previous answer.
-    user_texts = []
+    user_texts: list[tuple[str, bool, bool]] = []
     for turn in history:
-        user_texts.append(str(turn.get("user", "")))
-        user_texts.append(str(turn.get("assistant", "")))
-    user_texts.append(question)
+        user_texts.append((str(turn.get("user", "")), False, False))
+        user_texts.append((str(turn.get("assistant", "")), True, False))
+    user_texts.append((question, False, True))
     result: dict[str, str] = {"modo_consulta": query_mode(question, history)}
+    ambiguity = _ambiguous_machine_choice(question)
+    if not ambiguity and current_period_explicit:
+        for turn in reversed(history):
+            prior_question = str(turn.get("user", ""))
+            ambiguity = _ambiguous_machine_choice(prior_question)
+            if ambiguity:
+                break
+            if re.search(r"\bRB\s*[-_ ]?\s*\d+\b", prior_question, re.IGNORECASE):
+                break
+    if ambiguity:
+        result["requiere_aclaracion"] = "maquinas"
+        result["alternativas_maquina"] = ",".join(ambiguity)
     prefix_match = re.search(
         r"\b(?:empiez\w*|comienz\w*|prefijo|c[oó]digo)\D{0,25}(\d{3,6})\b",
         question,
@@ -764,16 +1068,34 @@ def active_filters(question: str, history: list[dict[str, str]]) -> dict[str, st
     )
     if prefix_match:
         result["articulo_prefijo"] = prefix_match.group(1)
-    for text in reversed(user_texts):
+    for text, is_assistant, is_current in reversed(user_texts):
         if "alcance_temporal" not in result and re.search(
             r"\b(?:historico|historica|historicamente|todo\s+el\s+historico|"
             r"todos\s+los\s+datos|periodo\s+completo)\b",
             normalized_business_text(text),
         ):
             result["alcance_temporal"] = "historico"
-        if "maquina" not in result:
+        prior_assistant_entity_unsafe = is_assistant and current_period_explicit
+        if (
+            not is_assistant
+            and (is_current or not clears_machine)
+            and "maquina" not in result
+            and "maquinas" not in result
+        ):
+            named_machines = tuple(dict.fromkeys(
+                f"RB{match.group(1)}"
+                for match in re.finditer(r"\bRB\s*[-_ ]?\s*(\d+)\b", text, re.IGNORECASE)
+            ))
+            if len(named_machines) > 1:
+                result["maquinas"] = ",".join(named_machines)
+        if (
+            "maquina" not in result
+            and "maquinas" not in result
+            and not prior_assistant_entity_unsafe
+            and (is_current or not clears_machine)
+        ):
             machine = re.search(r"\bRB\s*[-_ ]?\s*(\d+)\b", text, re.IGNORECASE)
-            if not machine:
+            if not machine and not (is_current and clears_machine):
                 machine = re.search(
                     r"\b(?:robot|m[aá]quina|equipo)\s*(?:RB\s*)?[-_ ]?\s*(\d+)\b",
                     text,
@@ -781,7 +1103,12 @@ def active_filters(question: str, history: list[dict[str, str]]) -> dict[str, st
                 )
             if machine:
                 result["maquina"] = f"RB{machine.group(1)}"
-        if "articulo" not in result and "articulo_prefijo" not in result:
+        if (
+            "articulo" not in result
+            and "articulo_prefijo" not in result
+            and (is_current or not clears_article)
+            and not prior_assistant_entity_unsafe
+        ):
             article = re.search(
                 r"\b(?:art[ií]culo|pieza|referencia|producto)\s+([A-Z0-9][A-Z0-9.\-]{7,})\b",
                 text,
@@ -795,7 +1122,7 @@ def active_filters(question: str, history: list[dict[str, str]]) -> dict[str, st
                 )
             if article and not re.fullmatch(r"RB\d+", article.group(1), re.IGNORECASE):
                 result["articulo"] = article.group(1).upper()
-        if "semana" not in result and "fecha_desde" not in result:
+        if (is_current or not current_period_explicit) and "semana" not in result and "fecha_desde" not in result:
             week = re.search(r"\b(20\d{2})\s*[-/]\s*(\d{1,2})\b(?!\s*[-/])", text)
             if week:
                 result["semana"] = f"{week.group(1)}-{int(week.group(2)):02d}"
@@ -809,11 +1136,15 @@ def active_filters(question: str, history: list[dict[str, str]]) -> dict[str, st
                     explicit_year = re.search(r"\b(20\d{2})\b", text)
                     year = int(explicit_year.group(1)) if explicit_year else datetime.now(MADRID_TZ).year
                     result["semana"] = f"{year}-{int(short_week.group(1)):02d}"
-        if "anio" not in result:
+        if (is_current or not current_period_explicit) and "anio" not in result:
             year = re.search(r"\b(20\d{2})\b", text)
             if year:
                 result["anio"] = year.group(1)
-        if "fecha_desde" not in result and "semana" not in result:
+        if (
+            (is_current or not current_period_explicit)
+            and "fecha_desde" not in result
+            and "semana" not in result
+        ):
             temporal = resolve_temporal_context(text)
             if temporal.get("fecha_desde"):
                 result["fecha_desde"] = temporal["fecha_desde"]
@@ -822,7 +1153,7 @@ def active_filters(question: str, history: list[dict[str, str]]) -> dict[str, st
         # follow-up such as “las cinco paradas OEE más largas” must still inherit
         # the preceding machine/week. Stop only when the message is explicitly
         # global or introduces its own temporal scope.
-        explicit_global = bool(re.search(
+        text_explicit_global = bool(re.search(
             r"\b(?:todos|todas)\s+(?:los|las)\s+(?:robots|m[aá]quinas|art[ií]culos|incidencias|paradas)\b|"
             r"\b(?:global|globales|de\s+planta)\b",
             text,
@@ -849,8 +1180,8 @@ def active_filters(question: str, history: list[dict[str, str]]) -> dict[str, st
             text,
             re.IGNORECASE,
         ))
-        if (
-            explicit_global
+        if not is_current and not is_assistant and (
+            text_explicit_global
             or explicit_temporal_scope
             or explicit_annual_scope
             or explicit_historical_scope
@@ -863,6 +1194,7 @@ def active_filters(question: str, history: list[dict[str, str]]) -> dict[str, st
     })
     if len(mentioned_machines) > 1:
         result["maquinas"] = ",".join(mentioned_machines)
+        result.pop("maquina", None)
     return result
 
 
@@ -979,8 +1311,9 @@ def capability_response(question: str, history: list[dict[str, str]]) -> str | N
     ))
     asks_capabilities = bool(re.search(
         r"\b(?:alcance|capacidades|funciones)\b|"
-        r"(?:qu[eé]|cuales|cu[aá]les).*(?:tipo de preguntas|preguntas).*(?:puedo|puedes|hacer|realizar)|"
-        r"(?:qu[eé]|que).*(?:puedes|sabes hacer|ayuda)",
+        r"(?:qu[eé]|cuales|cu[aá]les).{0,35}(?:tipo de preguntas|preguntas).{0,25}(?:puedo|puedes|hacer|realizar)|"
+        r"\b(?:qu[eé]\s+puedes\s+hacer|en\s+qu[eé]\s+puedes\s+ayudar(?:me)?|"
+        r"qu[eé]\s+ayuda\s+puedes\s+dar(?:me)?)\b",
         normalized,
     ))
     if not asks_capabilities and not asks_process:
@@ -1706,6 +2039,337 @@ LIMIT 1
 """.strip()
 
 
+def _asks_availability_component_breakdown(question: str) -> bool:
+    normalized = lexical_intent_text(question)
+    return bool(
+        re.search(r"\bdisponibilidad\b", normalized)
+        and re.search(r"\b(?:desglos\w*|componentes?|descompon\w*|calculo)\b", normalized)
+    )
+
+
+def deterministic_availability_breakdown_sql(
+    question: str, history: list[dict[str, str]]
+) -> str | None:
+    """Return only the availability inputs exposed by the OEE master view."""
+    if not _asks_availability_component_breakdown(question):
+        return None
+    filters = active_filters(question, history)
+    if not filters.get("maquina"):
+        return None
+    predicates = [f"UPPER(TRIM(maquina)) = '{filters['maquina']}'"]
+    if filters.get("semana"):
+        predicates.append(f"semana = '{filters['semana']}'")
+    elif filters.get("fecha_desde"):
+        predicates.append(
+            f"fecha BETWEEN DATE '{filters['fecha_desde']}' "
+            f"AND DATE '{filters['fecha_hasta']}'"
+        )
+    elif filters.get("anio"):
+        predicates.append(f"EXTRACT(YEAR FROM fecha) = {int(filters['anio'])}")
+    if filters.get("articulo"):
+        predicates.append(f"UPPER(TRIM(articulo)) = '{filters['articulo']}'")
+    where_clause = " AND\n      ".join(predicates)
+    return f"""
+SELECT
+  COUNT(*) AS filas_fuente,
+  SUM(tiempo_plan) AS tiempo_plan,
+  SUM(tiempo_erp_capado) AS tiempo_erp_capado,
+  CASE
+    WHEN SUM(tiempo_plan) = 0 THEN NULL
+    ELSE SUM(tiempo_erp_capado) / SUM(tiempo_plan)
+  END AS disponibilidad_pct
+FROM `{PROJECT_ID}.{DATASET_ID}.vw_oee_master`
+WHERE {where_clause}
+LIMIT 1
+""".strip()
+
+
+def is_causal_availability_question(question: str) -> bool:
+    """Match causal questions about low availability without capturing generic why questions."""
+    normalized = lexical_intent_text(question)
+    asks_why = bool(re.search(r"\b(?:por\s+que|explica\w*|causa\w*|motivo\w*)\b", normalized))
+    mentions_availability = bool(re.search(r"\bdisponibilidad\b", normalized))
+    low_availability = bool(re.search(r"\b(?:baj\w*|reducid\w*|escas\w*|limitad\w*)\b", normalized))
+    return asks_why and mentions_availability and low_availability
+
+
+def _causal_period_is_explicit(text: str) -> bool:
+    normalized = normalized_business_text(text)
+    return bool(
+        resolve_temporal_context(text).get("fecha_desde")
+        or re.search(r"\b20\d{2}\s*[-/]\s*\d{1,2}\b", text)
+        or re.search(r"\b(?:semana|s)\s*[-_/ ]?\s*\d{1,2}\b", text, re.I)
+        or re.search(r"\b20\d{2}\b", normalized)
+        or re.search(
+            r"\b(?:historico|historica|historicamente|todo\s+el\s+historico|"
+            r"todos\s+los\s+datos|periodo\s+completo)\b",
+            normalized,
+        )
+    )
+
+
+def causal_availability_filters(
+    question: str, history: list[dict[str, str]]
+) -> dict[str, str]:
+    """Apply stricter, causal-only scope rules without changing global filter inheritance."""
+    filters = active_filters(question, history)
+    explicit_current_scope = _causal_period_is_explicit(question)
+    if not explicit_current_scope:
+        latest = history[-1] if history else {}
+        latest_question = str(latest.get("user", ""))
+        latest_answer = str(latest.get("assistant", ""))
+        latest_has_oee_scope = (
+            _conversation_domain(latest_question) == "oee"
+            and _causal_period_is_explicit(latest_question + " " + latest_answer)
+        )
+        inherited_historical_scope = filters.get("alcance_temporal") == "historico"
+        if not latest_has_oee_scope or inherited_historical_scope:
+            for key in ("fecha_desde", "fecha_hasta", "semana", "anio", "alcance_temporal"):
+                filters.pop(key, None)
+            filters["requiere_aclaracion"] = "periodo"
+    return filters
+
+
+def causal_availability_period_label(filters: dict[str, str]) -> str | None:
+    if filters.get("fecha_desde"):
+        start, end = filters["fecha_desde"], filters.get("fecha_hasta", filters["fecha_desde"])
+        return start if start == end else f"{start}–{end}"
+    if filters.get("semana"):
+        return f"semana ISO {filters['semana']}"
+    if filters.get("anio"):
+        return f"año {filters['anio']}"
+    if filters.get("alcance_temporal") == "historico":
+        return "todo el histórico solicitado"
+    return None
+
+
+def deterministic_causal_availability_sql(question: str, history: list[dict[str, str]]) -> tuple[str, str] | None:
+    """Build separate OEE and deduplicated stop summaries for one explicit scope."""
+    if not is_causal_availability_question(question):
+        return None
+    filters = causal_availability_filters(question, history)
+    machine = filters.get("maquina")
+    if not machine or filters.get("maquinas") or filters.get("requiere_aclaracion"):
+        return None
+    predicates = [f"UPPER(TRIM(maquina)) = '{machine}'"]
+    stop_predicates = [f"UPPER(TRIM(maquina)) = '{machine}'"]
+    if filters.get("fecha_desde"):
+        start, end = filters["fecha_desde"], filters["fecha_hasta"]
+        predicates.append(f"fecha BETWEEN DATE '{start}' AND DATE '{end}'")
+        stop_predicates.append(f"fecha_operativa BETWEEN DATE '{start}' AND DATE '{end}'")
+    elif filters.get("semana"):
+        year, week = (int(part) for part in filters["semana"].split("-"))
+        start = date.fromisocalendar(year, week, 1).isoformat()
+        end = date.fromisocalendar(year, week, 7).isoformat()
+        predicates.append(f"fecha BETWEEN DATE '{start}' AND DATE '{end}'")
+        stop_predicates.append(f"fecha_operativa BETWEEN DATE '{start}' AND DATE '{end}'")
+    elif filters.get("anio"):
+        predicates.append(f"EXTRACT(YEAR FROM fecha) = {int(filters['anio'])}")
+        stop_predicates.append(f"EXTRACT(YEAR FROM fecha_operativa) = {int(filters['anio'])}")
+    elif filters.get("alcance_temporal") != "historico":
+        return None
+    oee_sql = f"""
+SELECT COUNT(*) AS filas_fuente, SUM(tiempo_plan) AS tiempo_plan,
+  SUM(tiempo_erp_capado) AS tiempo_erp_capado,
+  CASE WHEN SUM(tiempo_plan) = 0 THEN NULL
+       ELSE SUM(tiempo_erp_capado) / SUM(tiempo_plan) END AS disponibilidad_pct
+FROM `{PROJECT_ID}.{DATASET_ID}.vw_oee_master`
+WHERE {' AND '.join(predicates)}
+LIMIT 1
+""".strip()
+    stop_sql = f"""
+WITH paradas_por_id AS (
+  SELECT id_parada,
+    COUNTIF(UPPER(TRIM(oee)) = 'SI') AS etiquetas_si,
+    COUNTIF(UPPER(TRIM(oee)) = 'NO') AS etiquetas_no,
+    COUNTIF(oee IS NULL OR UPPER(TRIM(oee)) NOT IN ('SI', 'NO')) AS etiquetas_desconocidas,
+    COUNTIF(tiempo_parada_min IS NULL) AS tramos_minutos_desconocidos,
+    SUM(tiempo_parada_min) AS minutos_conocidos
+  FROM `{PROJECT_ID}.{DATASET_ID}.vw_import_paradas`
+  WHERE {' AND '.join(stop_predicates)}
+  GROUP BY id_parada
+), paradas_consolidadas AS (
+  SELECT id_parada,
+    CASE
+      WHEN etiquetas_si > 0 AND etiquetas_no = 0 AND etiquetas_desconocidas = 0 THEN 'SI'
+      WHEN etiquetas_no > 0 AND etiquetas_si = 0 AND etiquetas_desconocidas = 0 THEN 'NO'
+      WHEN etiquetas_si > 0 AND etiquetas_no > 0 THEN 'INCONSISTENTE'
+      ELSE 'DESCONOCIDA'
+    END AS clasificacion_oee,
+    tramos_minutos_desconocidos,
+    minutos_conocidos
+  FROM paradas_por_id
+)
+SELECT COUNT(*) AS total_paradas,
+  COUNTIF(clasificacion_oee = 'SI') AS paradas_oee_si,
+  SUM(IF(clasificacion_oee = 'SI' AND tramos_minutos_desconocidos = 0, minutos_conocidos, NULL)) AS tiempo_oee_si,
+  COUNTIF(clasificacion_oee = 'SI' AND tramos_minutos_desconocidos > 0) AS paradas_si_minutos_desconocidos,
+  COUNTIF(clasificacion_oee = 'NO') AS paradas_oee_no,
+  SUM(IF(clasificacion_oee = 'NO' AND tramos_minutos_desconocidos = 0, minutos_conocidos, NULL)) AS tiempo_oee_no,
+  COUNTIF(clasificacion_oee = 'NO' AND tramos_minutos_desconocidos > 0) AS paradas_no_minutos_desconocidos,
+  COUNTIF(clasificacion_oee = 'DESCONOCIDA') AS paradas_oee_desconocidas,
+  SUM(IF(clasificacion_oee = 'DESCONOCIDA' AND tramos_minutos_desconocidos = 0, minutos_conocidos, NULL)) AS tiempo_oee_desconocido,
+  COUNTIF(clasificacion_oee = 'DESCONOCIDA' AND tramos_minutos_desconocidos > 0) AS paradas_desconocidas_minutos_null,
+  COUNTIF(clasificacion_oee = 'INCONSISTENTE') AS paradas_oee_inconsistentes,
+  SUM(IF(clasificacion_oee = 'INCONSISTENTE' AND tramos_minutos_desconocidos = 0, minutos_conocidos, NULL)) AS tiempo_oee_inconsistente,
+  COUNTIF(clasificacion_oee = 'INCONSISTENTE' AND tramos_minutos_desconocidos > 0) AS paradas_inconsistentes_minutos_null
+FROM paradas_consolidadas
+LIMIT 1
+""".strip()
+    return oee_sql, stop_sql
+
+
+def deterministic_causal_availability_answer(
+    oee_rows, stop_rows, oee_error=None, stop_error=None, machine=None, period=None
+) -> str:
+    """Present verified aggregates and stop labels without asserting quantitative causality."""
+    def fmt(value):
+        if value is None:
+            return "NULL"
+        try:
+            return f"{float(value):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        except (TypeError, ValueError):
+            return str(value)
+    def fmt_count(value):
+        if value is None:
+            return "NULL"
+        try:
+            return f"{int(value):,}".replace(",", ".")
+        except (TypeError, ValueError):
+            return str(value)
+    scope = "Alcance aplicado: "
+    scope += f"máquina {machine}" if machine else "máquina no confirmada"
+    scope += f"; periodo {period}" if period else "; periodo no confirmado"
+    sections = [scope, "Datos comprobados"]
+    if oee_error:
+        sections.append(f"La consulta OEE falló ({oee_error}); no hay agregados disponibles.")
+    elif not oee_rows:
+        sections.append("La consulta OEE no devolvió resultado; no se puede confirmar disponibilidad.")
+    else:
+        row = oee_rows[0]
+        availability = row.get("disponibilidad_pct")
+        pct = "NULL" if availability is None else f"{fmt(float(availability) * 100)} %"
+        sections.append(f"Filas OEE: {fmt(row.get('filas_fuente'))}; SUM(tiempo_plan): {fmt(row.get('tiempo_plan'))}; SUM(tiempo_erp_capado): {fmt(row.get('tiempo_erp_capado'))}; disponibilidad = SUM(tiempo_erp_capado) / SUM(tiempo_plan): {pct}. La unidad de tiempo de estos campos no está documentada en el esquema.")
+    sections.append("Paradas registradas")
+    if stop_error:
+        sections.append(f"La consulta de paradas falló ({stop_error}); no se puede determinar si hubo registros.")
+    elif not stop_rows:
+        sections.append("La consulta de paradas no devolvió resultado; no se puede determinar si hubo registros.")
+    else:
+        row = stop_rows[0]
+        if row.get("total_paradas") == 0:
+            sections.append("No hay paradas registradas en la consulta para ese alcance; esto no demuestra que no hubiera pérdidas.")
+        elif row.get("total_paradas") is None:
+            sections.append("El recuento de paradas no está disponible; no se puede determinar si hubo registros.")
+        else:
+            def category_details(label, count_key, minutes_key, unknown_key):
+                count = row.get(count_key)
+                if count is None:
+                    return f"{label}: recuento no disponible."
+                if int(count) == 0:
+                    return f"{label}: 0 incidencias."
+                return (
+                    f"{label}: {fmt_count(count)} incidencias; suma de minutos de incidencias "
+                    f"con todos sus tramos conocidos: {fmt(row.get(minutes_key))}; "
+                    f"duración desconocida por minutos NULL en "
+                    f"{fmt_count(row.get(unknown_key))} incidencias."
+                )
+
+            category_text = " ".join((
+                category_details("oee='SI'", "paradas_oee_si", "tiempo_oee_si", "paradas_si_minutos_desconocidos"),
+                category_details("oee='NO'", "paradas_oee_no", "tiempo_oee_no", "paradas_no_minutos_desconocidos"),
+                category_details("Etiqueta desconocida/NULL", "paradas_oee_desconocidas", "tiempo_oee_desconocido", "paradas_desconocidas_minutos_null"),
+                category_details("Etiquetas inconsistentes", "paradas_oee_inconsistentes", "tiempo_oee_inconsistente", "paradas_inconsistentes_minutos_null"),
+            ))
+            sections.append(
+                f"Incidencias deduplicadas: {fmt_count(row.get('total_paradas'))}. {category_text}"
+            )
+    sections.extend(("Qué puede concluirse", "La disponibilidad refleja únicamente la fórmula corporativa. Las etiquetas oee='SI'/'NO' clasifican paradas, pero no cuantifican por sí solas su efecto sobre la disponibilidad; una incidencia con etiquetas mixtas no se asigna a SI ni a NO, y no se atribuye causalidad a incidencias concretas."))
+    return "\n\n".join(sections)
+
+
+def deterministic_availability_breakdown_answer(
+    question: str,
+    rows: list[dict],
+    sql: str,
+    history: list[dict[str, str]],
+) -> str | None:
+    """Report available OEE aggregates and state which requested components are not proven."""
+    expected_sql = deterministic_availability_breakdown_sql(question, history)
+    if not expected_sql or not sql or sql.strip() != expected_sql.strip():
+        return None
+    if not rows:
+        return (
+            "La consulta de desglose no devolvió una fila de resultado. No puedo distinguir "
+            "con seguridad si faltan datos o si el resultado está incompleto; no estimaré tiempos."
+        )
+    row = rows[0]
+    required_fields = {
+        "filas_fuente", "tiempo_plan", "tiempo_erp_capado", "disponibilidad_pct"
+    }
+    if not required_fields.issubset(row):
+        return None
+
+    def format_value(value):
+        if value is None:
+            return "no disponible"
+        try:
+            return f"{float(value):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        except (TypeError, ValueError):
+            return str(value)
+
+    try:
+        source_rows = int(row["filas_fuente"])
+    except (TypeError, ValueError):
+        return None
+    if source_rows == 0:
+        return (
+            "No hay filas de origen para la máquina y el periodo consultados. "
+            "Las sumas y la disponibilidad quedan NULL; no hay tiempos que pueda desglosar "
+            "y no los estimaré."
+        )
+
+    details = []
+    for label, field in (
+        ("SUM(tiempo_plan)", "tiempo_plan"),
+        ("SUM(tiempo_erp_capado)", "tiempo_erp_capado"),
+    ):
+        value = row[field]
+        details.append(f"{label} = {format_value(value)}")
+
+    planned = row["tiempo_plan"]
+    numerator = row["tiempo_erp_capado"]
+    availability = row["disponibilidad_pct"]
+    if planned is None:
+        status = "SUM(tiempo_plan) es NULL, por lo que la fórmula devuelve NULL."
+    else:
+        try:
+            planned_value = float(planned)
+        except (TypeError, ValueError):
+            return None
+        if planned_value == 0:
+            status = "SUM(tiempo_plan) es cero, por lo que la fórmula corporativa devuelve NULL."
+        elif numerator is None:
+            status = "SUM(tiempo_erp_capado) es NULL; no se sustituye por cero y la disponibilidad es NULL."
+        elif availability is None:
+            status = "La fórmula corporativa no produjo una disponibilidad numérica."
+        else:
+            status = (
+                "Disponibilidad calculada sobre los totales: "
+                f"{float(availability) * 100:.2f}%."
+            )
+    return (
+        "Agregados devueltos (sin unidad especificada en el esquema): " + "; ".join(details) + ". "
+        + status + " La vista define disponibilidad como "
+        "CASE WHEN SUM(tiempo_plan) = 0 THEN NULL ELSE "
+        "SUM(tiempo_erp_capado) / SUM(tiempo_plan) END; "
+        "pero no permite identificar por separado un tiempo operativo ni reconciliar la "
+        "duración de paradas OEE con ese indicador. vw_oee_master ya integra y prorratea "
+        "paradas, mientras vw_import_paradas ofrece incidencias por separado; sumar o "
+        "restar sus duraciones aquí no sería verificable. No estimaré los componentes ausentes."
+    )
+
+
 def planner_requested_weeks(question: str) -> list[int]:
     """Extract one or more planning-week numbers without treating the year as a week."""
     if re.search(
@@ -1736,6 +2400,47 @@ def planner_requested_weeks(question: str) -> list[int]:
         for value in re.findall(r"\d{1,2}", match.group(1))
         if 1 <= int(value) <= 53
     })
+
+
+def planner_requested_iso_periods(question: str) -> list[tuple[int, int]]:
+    """Extract validated YYYY-WW pairs without collapsing weeks from different years."""
+    periods = []
+    for year_text, week_text in re.findall(
+        r"\b(20\d{2})\s*[-/]\s*(\d{1,2})\b(?!\s*[-/]\s*\d{1,2}\b)",
+        question,
+    ):
+        year, week = int(year_text), int(week_text)
+        try:
+            date.fromisocalendar(year, week, 1)
+        except ValueError:
+            continue
+        period = (year, week)
+        if period not in periods:
+            periods.append(period)
+    return periods
+
+
+def has_planner_load_comparison_intent(
+    question: str, history: list[dict[str, str]]
+) -> bool:
+    """Recover an elliptical comparison intent only inside planner context."""
+    normalized = lexical_intent_text(question)
+    comparison = r"\b(?:compara\w*|comparaci[oó]n|entre)\b"
+    load = r"\b(?:carga pendiente|trabajo pendiente|backlog|cartera)\b"
+    if re.search(comparison, normalized) and re.search(load, normalized):
+        return True
+    current_domain = _conversation_domain(question)
+    if current_domain and current_domain != "planificador":
+        return False
+    for turn in reversed(history):
+        prior_question = str(turn.get("user", ""))
+        prior_domain = _conversation_domain(prior_question)
+        if prior_domain and prior_domain != "planificador":
+            return False
+        prior_normalized = lexical_intent_text(prior_question)
+        if re.search(comparison, prior_normalized) and re.search(load, prior_normalized):
+            return True
+    return False
 
 
 def planner_context_weeks(question: str, history: list[dict[str, str]]) -> list[int]:
@@ -1824,19 +2529,43 @@ def deterministic_planner_week_load_sql(
     ):
         return None
     weeks = planner_context_weeks(question, history)
+    explicit_iso_periods = planner_requested_iso_periods(question)
+    is_two_week_load_comparison = bool(
+        asks_pending_load
+        and has_planner_load_comparison_intent(question, history)
+        and len(explicit_iso_periods) == 2
+    )
     # If no week is stated, allow a plant-wide current-year workload ranking.
     # This supports questions such as “¿qué robots están sobrecargados?”.
     year_match = re.search(r"\b(20\d{2})\b", question)
     year = int(year_match.group(1)) if year_match else datetime.now(MADRID_TZ).year
-    planner_filters = [f"EXTRACT(YEAR FROM fecha_necesidad) = {year}"]
-    if weeks:
+    if is_two_week_load_comparison:
+        iso_period_predicates = [
+            "(EXTRACT(ISOYEAR FROM fecha_necesidad) = "
+            f"{period_year} AND CAST(semana_necesidad AS STRING) = '{period_week}')"
+            for period_year, period_week in explicit_iso_periods
+        ]
+        planner_filters = ["(" + " OR ".join(iso_period_predicates) + ")"]
+    else:
+        planner_filters = [f"EXTRACT(YEAR FROM fecha_necesidad) = {year}"]
+    if weeks and not is_two_week_load_comparison:
         planner_filters.append(
             f"CAST(semana_necesidad AS STRING) IN ({', '.join(repr(str(week)) for week in weeks)})"
         )
-    direct_machine = re.search(r"\bRB\s*[-_ ]?\s*(\d+)\b", question, re.IGNORECASE)
-    machine = f"RB{direct_machine.group(1)}" if direct_machine else None
-    if machine:
-        planner_filters.append(f"UPPER(TRIM(maquina)) = '{machine}'")
+    # Use reconciled conversational filters so an elliptical period change
+    # keeps the machine scope selected in the preceding planner request.
+    filters = active_filters(question, history)
+    machine_ids = [
+        machine for machine in filters.get("maquinas", "").split(",")
+        if re.fullmatch(r"RB\d+", machine)
+    ]
+    if machine_ids:
+        machine_values = ", ".join(repr(machine) for machine in machine_ids)
+        planner_filters.append(f"UPPER(TRIM(maquina)) IN ({machine_values})")
+    else:
+        machine = filters.get("maquina", "")
+        if re.fullmatch(r"RB\d+", machine):
+            planner_filters.append(f"UPPER(TRIM(maquina)) = '{machine}'")
 
     if asks_quantity_ranking:
         order_metric = "cantidad_pendiente DESC"
@@ -1871,6 +2600,7 @@ LIMIT {MAX_RESULT_ROWS}
 
     return f"""
 SELECT
+  {"EXTRACT(ISOYEAR FROM fecha_necesidad) AS anio_iso," if is_two_week_load_comparison else ""}
   semana_necesidad,
   UPPER(TRIM(maquina)) AS maquina,
   COUNT(DISTINCT pev) AS ordenes,
@@ -1886,7 +2616,7 @@ FROM `{PROJECT_ID}.{DATASET_ID}.vw_planificador_capacidad`
   WHERE {' AND '.join(planner_filters)}
   AND REGEXP_CONTAINS(UPPER(TRIM(maquina)), r'^RB[0-9]+$')
   AND IFNULL(cantidad_pendiente, 0) > 0
-GROUP BY semana_necesidad, maquina{saturation_having}
+GROUP BY {"EXTRACT(ISOYEAR FROM fecha_necesidad), " if is_two_week_load_comparison else ""}semana_necesidad, maquina{saturation_having}
 ORDER BY semana_necesidad, {order_metric}, maquina
 LIMIT {MAX_RESULT_ROWS}
 """.strip()
@@ -2088,10 +2818,14 @@ def deterministic_balance_suggestions_sql(
         predicates.append(f"UPPER(TRIM(articulo)) = '{article}'")
     if filters.get("semana"):
         _, week = filters["semana"].split("-", 1)
-        predicates.append(
-            "SAFE_CAST(REGEXP_EXTRACT(CAST(semana AS STRING), r'(\\d{1,2})$') AS INT64) "
-            f"= {int(week)}"
-        )
+        # In the balance suggestions view, ``semana`` is the ISO week number
+        # and ``fecha`` identifies its ISO year. A user-supplied year is kept
+        # separately by active_filters(); an implicit current year is not.
+        if filters.get("anio"):
+            predicates.append(
+                f"EXTRACT(ISOYEAR FROM fecha) = {int(filters['anio'])}"
+            )
+        predicates.append(f"SAFE_CAST(semana AS INT64) = {int(week)}")
     elif filters.get("fecha_desde"):
         predicates.append(
             f"fecha BETWEEN DATE '{filters['fecha_desde']}' AND DATE '{filters['fecha_hasta']}'"
@@ -2565,6 +3299,26 @@ def semantic_rewrite_question(
         or re.search(r"\b(?:semana|s)\s*[-_/]?\s*\d{1,2}\b", question, re.IGNORECASE)
         or re.search(r"\b20\d{2}\b", question)
     )
+    explicit_entity = bool(
+        re.search(r"\bRB\s*[-_ ]?\s*\d+\b|\b(?:robot|m[aá]quina|equipo)\s*\d+\b", question, re.IGNORECASE)
+        or re.search(
+            r"\b(?:art[ií]culo|pieza|referencia|producto)\s+[A-Z0-9][A-Z0-9.\-]{7,}\b",
+            question,
+            re.IGNORECASE,
+        )
+        or re.search(r"\b(?:empiez\w*|comienz\w*|prefijo|c[oó]digo)\D{0,25}\d{3,6}\b", question, re.IGNORECASE)
+    )
+    explicit_scope_reset = bool(re.search(
+        r"\b(?:todos|todas)\s+(?:los|las)\s+(?:robots?|m[aá]quinas?|equipos?|art[ií]culos?|referencias?|piezas?)\b|"
+        r"\b(?:global(?:es)?|de\s+planta|todo\s+el\s+historico)\b",
+        normalized_original,
+    ))
+    period_only_update = bool(
+        has_explicit_scope
+        and not explicit_entity
+        and not explicit_scope_reset
+        and _conversation_domain(question) is None
+    )
     needs_previous_context = bool(re.search(
         r"\b(?:ese|esa|eso|esos|esas|mismo|misma|anterior|antes|"
         r"comparalo|comparala|compáralo|compárala|dame\s+detalles|por\s+que|por\s+qué)\b",
@@ -2586,10 +3340,15 @@ def semantic_rewrite_question(
     # scope. This prevents an old article or machine from leaking into a new
     # question such as «qué equipos van más apretados la semana que entra».
     recent_history = (
-        [] if (has_explicit_scope and not needs_previous_context) or broad_standalone_scope
+        [] if (
+            (has_explicit_scope and not needs_previous_context and not period_only_update)
+            or broad_standalone_scope
+        )
         else history[-4:] if history
         else []
     )
+    if active_filters(question, history).get("requiere_aclaracion"):
+        return question
     ranking_across_machines = bool(
         not re.search(r"\bRB\s*[-_ ]?\s*\d+\b", question, re.IGNORECASE)
         and re.search(r"\b(?:mejor|peor|mayor|menor)\b", normalized_original)
@@ -2669,19 +3428,30 @@ Mensaje original:
         end = deterministic_temporal.get("fecha_hasta")
         if start and start == end and start not in rewritten:
             rewritten += f" Fecha exacta obligatoria: {start}."
-        return rewritten
+        elif start and end and (start not in rewritten or end not in rewritten):
+            rewritten += f" Periodo exacto obligatorio: desde {start} hasta {end}."
+        return _reconcile_period_only_kpi_follow_up(question, rewritten, history)
     except Exception:
         logging.exception("No se pudo interpretar semánticamente la pregunta")
         return question
 
 
 def make_sql(question: str, schema: str, history: list[dict[str, str]]) -> str:
+    filters = active_filters(question, history)
+    if filters.get("requiere_aclaracion") == "maquinas":
+        alternatives = filters.get("alternativas_maquina", "").split(",")
+        if len(alternatives) == 2:
+            return (
+                f"ACLARAR: ¿Quieres analizar {alternatives[0]} o {alternatives[1]}, "
+                "o compararlos?"
+            )
     deterministic_builders = (
         deterministic_machine_metric_ranking_sql,
         deterministic_open_oee_diagnostic_sql,
         deterministic_balance_suggestions_sql,
         deterministic_planner_article_load_sql,
         deterministic_planner_week_load_sql,
+        deterministic_availability_breakdown_sql,
         deterministic_stop_summary_sql,
         deterministic_top_stops_sql,
         deterministic_stop_details_sql,
@@ -2915,6 +3685,22 @@ def execute_query(sql: str) -> list[dict]:
 
 def explain(question: str, rows: list[dict], history: list[dict[str, str]], sql: str) -> str:
     if not rows:
+        if "vw_import_paradas" in sql:
+            filters = active_filters(question, history)
+            scope = []
+            if filters.get("maquina"):
+                scope.append(f"la máquina {filters['maquina']}")
+            if filters.get("fecha_desde"):
+                scope.append(
+                    f"el periodo {filters['fecha_desde']}–{filters['fecha_hasta']}"
+                )
+            elif filters.get("semana"):
+                scope.append(f"la semana {filters['semana']}")
+            scope_text = " para " + " y ".join(scope) if scope else " con los filtros aplicados"
+            return (
+                f"No se encontraron registros de paradas{scope_text}; por tanto, "
+                "no hay incidencias de este resultado que permitan asociar una causa al periodo."
+            )
         if re.search(
             r"\b(?:redistribu|reasigna|mover|trasladar|repartir|balancear|equilibrar|"
             r"convendr[ií]a|podr[ií]a|asumir|robot\s+alternativo)\w*\b",
@@ -2936,6 +3722,8 @@ Reglas:
 - Los campos OEE o pct_* entre 0 y 1 son proporciones: muéstralos como porcentaje con dos decimales.
 - Mantén las duraciones en la unidad indicada por el nombre o los datos; no inventes unidades.
 - Distingue OEE de No OEE y no atribuyas causas que no estén en los resultados.
+- Al relacionar incidencias con un KPI, distingue una coincidencia temporal de una causa
+  demostrada. Una parada del periodo no prueba por sí sola que causara el valor del indicador.
 - En datos de paradas, el valor SI de la columna oee se redacta como "OEE / no planificada" y
   el valor NO como "No OEE / planificada". No inviertas esta equivalencia.
 - Equivalencia inmutable: SI = no planificada; NO = planificada. Por ejemplo, si los resultados
@@ -3091,6 +3879,166 @@ def deterministic_planner_answer(question: str, rows: list[dict]) -> str | None:
             f"con {value_text} {unit} de desviación."
         )
     return None
+
+
+def deterministic_planner_comparison_answer(
+    question: str, rows: list[dict], sql: str, history: list[dict[str, str]] | None = None
+) -> str | None:
+    """Compare two ISO need-weeks, including one absent positive-load result, safely."""
+    history = history or []
+    if not has_planner_load_comparison_intent(question, history):
+        return None
+    requested_periods = planner_requested_iso_periods(question)
+    if len(requested_periods) != 2 or len(rows) not in (1, 2):
+        return None
+
+    # The comparison SQL path filters each ISO year/week pair independently.
+    sql_periods = [
+        (int(year), int(week))
+        for year, week in re.findall(
+            r"EXTRACT\(ISOYEAR FROM fecha_necesidad\)\s*=\s*(20\d{2})\s+AND\s+"
+            r"CAST\(semana_necesidad AS STRING\)\s*=\s*'?(\d{1,2})'?",
+            sql,
+            re.IGNORECASE,
+        )
+    ]
+    if (
+        "vw_planificador_capacidad" not in sql.lower()
+        or not re.search(r"IFNULL\(cantidad_pendiente,\s*0\)\s*>\s*0", sql, re.I)
+        or set(sql_periods) != set(requested_periods)
+        or len(sql_periods) != 2
+    ):
+        return None
+
+    expected_machine_matches = re.findall(r"\bRB\s*[-_ ]?\s*(\d+)\b", question, re.I)
+    expected_machine = f"RB{expected_machine_matches[0]}" if len(set(expected_machine_matches)) == 1 else None
+    filters = active_filters(question, history)
+    if filters.get("requiere_aclaracion") or filters.get("maquinas"):
+        return None
+    if expected_machine is None:
+        expected_machine = filters.get("maquina")
+    sql_machines = re.findall(
+        r"UPPER\(TRIM\(maquina\)\)\s*=\s*'([^']+)'", sql, re.I
+    )
+    if (
+        len(sql_machines) != 1
+        or re.search(r"UPPER\(TRIM\(maquina\)\)\s+IN\s*\(", sql, re.I)
+        or (expected_machine and sql_machines[0].upper() != expected_machine.upper())
+    ):
+        return None
+    period_rows: dict[tuple[int, int], dict] = {}
+    machines = set()
+    for row in rows:
+        try:
+            raw_week = str(row.get("semana_necesidad", "")).strip()
+            paired_week = re.fullmatch(r"(20\d{2})[-/](\d{1,2})", raw_week)
+            if paired_week:
+                row_period = tuple(map(int, paired_week.groups()))
+            else:
+                week = int(raw_week)
+                year_value = row.get("anio_iso")
+                if year_value is not None:
+                    row_period = (int(year_value), week)
+                else:
+                    possible_years = [year for year, candidate_week in requested_periods if candidate_week == week]
+                    if len(possible_years) != 1:
+                        first_date = date.fromisoformat(str(row["primera_fecha_necesidad"]))
+                        last_date = date.fromisoformat(str(row["ultima_fecha_necesidad"]))
+                        first_iso, last_iso = first_date.isocalendar(), last_date.isocalendar()
+                        if (
+                            first_iso.week != week or last_iso.week != week
+                            or first_iso.year != last_iso.year
+                        ):
+                            return None
+                        row_period = (first_iso.year, week)
+                    else:
+                        row_period = (possible_years[0], week)
+            date.fromisocalendar(*row_period, 1)
+            if row_period not in requested_periods or row_period in period_rows:
+                return None
+            quantity = Decimal(str(row["cantidad_pendiente"]))
+            if not quantity.is_finite():
+                return None
+            machine = str(row.get("maquina") or row.get("equipo") or "").strip().upper()
+            if not machine:
+                return None
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            return None
+        period_rows[row_period] = row
+        machines.add(machine)
+
+    if not set(period_rows).issubset(set(requested_periods)) or len(machines) != 1:
+        return None
+    machine = next(iter(machines))
+    if expected_machine and machine != expected_machine:
+        return None
+    initial_period, final_period = requested_periods
+
+    def quantity_text(value: Decimal) -> str:
+        decimals = 0 if value == value.to_integral_value() else 2
+        return spanish_number(value, decimals)
+
+    if len(period_rows) == 1:
+        period_details = []
+        for period in requested_periods:
+            label = f"{period[0]}-{period[1]:02d}"
+            row = period_rows.get(period)
+            if row is None:
+                period_details.append(
+                    f"en la semana {label} no se encontraron registros de carga pendiente positiva"
+                )
+                continue
+            try:
+                amount = Decimal(str(row["cantidad_pendiente"]))
+            except (KeyError, TypeError, ValueError, ArithmeticError):
+                return None
+            if amount <= 0:
+                return None
+            period_details.append(
+                f"en la semana {label} se encontraron {quantity_text(amount)} unidades de carga pendiente positiva"
+            )
+        return (
+            f"Para {machine}, la consulta encontró: " + "; ".join(period_details) + ". "
+            "Al faltar una fila para uno de los periodos, no se puede calcular la diferencia "
+            "ni la variación porcentual."
+        )
+
+    try:
+        initial = Decimal(str(period_rows[initial_period]["cantidad_pendiente"]))
+        final = Decimal(str(period_rows[final_period]["cantidad_pendiente"]))
+    except (KeyError, TypeError, ValueError, ArithmeticError):
+        return None
+    difference = final - initial
+
+    start_label = f"{initial_period[0]}-{initial_period[1]:02d}"
+    end_label = f"{final_period[0]}-{final_period[1]:02d}"
+    if difference > 0:
+        direction = "aumentó"
+    elif difference < 0:
+        direction = "disminuyó"
+    else:
+        direction = "se mantuvo sin variación"
+    comparison = (
+        f"La carga pendiente de {machine} {direction}: "
+        f"{quantity_text(initial)} unidades en la semana {start_label} y "
+        f"{quantity_text(final)} unidades en la semana {end_label}; "
+        f"la diferencia absoluta es de {quantity_text(abs(difference))} unidades."
+    )
+    if initial == 0:
+        variation = "El cambio relativo no se puede calcular porque la carga inicial es cero."
+    else:
+        relative = abs(difference / initial * Decimal(100))
+        relative_text = spanish_number(relative, 2)
+        if difference > 0:
+            relative_description = f"un aumento del {relative_text}%"
+        elif difference < 0:
+            relative_description = f"una disminución del {relative_text}%"
+        else:
+            relative_description = f"del {relative_text}%"
+        variation = (
+            f"La variación relativa fue {relative_description} respecto a la semana inicial."
+        )
+    return comparison + " " + variation
 
 
 def deterministic_balance_answer(rows: list[dict]) -> str | None:
@@ -3403,7 +4351,32 @@ def append_calculation_trace(
     filters = active_filters(question, history)
     normalized_sql = re.sub(r"\s+", " ", sql.lower())
     sql_dates = sorted(set(re.findall(r"date\s*'((?:20)\d{2}-\d{2}-\d{2})'", normalized_sql)))
-    if len(sql_dates) > 1:
+    if "vw_planificador_capacidad" in normalized_sql:
+        iso_periods = [
+            (int(year), int(week))
+            for year, week in re.findall(
+                r"extract\(isoyear from fecha_necesidad\)\s*=\s*(20\d{2})\s+and\s+"
+                r"cast\(semana_necesidad as string\)\s*=\s*'?(\d{1,2})'?",
+                normalized_sql,
+            )
+        ]
+        if iso_periods:
+            labels = [f"{year}-{week:02d}" for year, week in iso_periods]
+            period = "las semanas de necesidad ISO " + " y ".join(labels)
+        else:
+            year_match = re.search(r"extract\(year from fecha_necesidad\)\s*=\s*(20\d{2})", normalized_sql)
+            weeks_match = re.search(
+                r"cast\(semana_necesidad as string\)\s+in\s*\(([^)]*)\)",
+                normalized_sql,
+            )
+            week_numbers = re.findall(r"['\"]?(\d{1,2})['\"]?", weeks_match.group(1)) if weeks_match else []
+            if year_match and week_numbers:
+                year_label = f" (fecha_necesidad en año calendario {year_match.group(1)})"
+                noun = "la semana de necesidad " if len(week_numbers) == 1 else "las semanas de necesidad "
+                period = noun + " y ".join(week_numbers) + year_label
+            else:
+                period = "los periodos de necesidad filtrados por SQL (año no identificable con seguridad)"
+    elif len(sql_dates) > 1:
         period = "las fechas " + " y ".join(sql_dates)
     elif filters.get("semana"):
         period = f"la semana {filters['semana']}"
@@ -3525,8 +4498,54 @@ def chat_event():
         )
         progress_message_name = create_progress_message(space_name)
 
-    if history and is_explanation_request(question):
+    if history and is_explanation_request(question) and not is_causal_availability_question(question):
         return remembered_response(explain_history(question, history))
+
+    if is_causal_availability_question(question):
+        filters = causal_availability_filters(question, history)
+        causal_sql = deterministic_causal_availability_sql(question, history)
+        if causal_sql is None:
+            if filters.get("maquinas") or filters.get("requiere_aclaracion") == "maquinas":
+                alternatives = filters.get("alternativas_maquina") or filters.get("maquinas", "")
+                options = " o ".join(part for part in alternatives.split(",") if part)
+                return remembered_response(
+                    f"¿Qué máquina quieres analizar{': ' + options if options else ''}?"
+                )
+            missing = []
+            if not filters.get("maquina"):
+                missing.append("la máquina")
+            if not causal_availability_period_label(filters):
+                missing.append("el periodo")
+            return remembered_response("Para comprobarlo necesito que indiques " + " y ".join(missing or ["un alcance válido"]) + ".")
+        try:
+            _, causal_allowed_views = dataset_schema()
+            oee_sql, stops_sql = causal_sql
+            validate_sql(oee_sql, causal_allowed_views)
+            validate_sql(stops_sql, causal_allowed_views)
+            try:
+                oee_rows, oee_error = execute_query(oee_sql), None
+            except Exception as error:
+                logging.exception("Falló la consulta OEE del diagnóstico causal")
+                oee_rows, oee_error = None, type(error).__name__
+            try:
+                stop_rows, stop_error = execute_query(stops_sql), None
+            except Exception as error:
+                logging.exception("Falló la consulta de paradas del diagnóstico causal")
+                stop_rows, stop_error = None, type(error).__name__
+            return remembered_response(deterministic_causal_availability_answer(
+                oee_rows,
+                stop_rows,
+                oee_error,
+                stop_error,
+                filters.get("maquina"),
+                causal_availability_period_label(filters),
+            ))
+        except Exception as error:
+            logging.exception("No se pudo preparar el diagnóstico causal")
+            return remembered_response(
+                f"No se pudo preparar el diagnóstico causal ({type(error).__name__}); "
+                "no hay resultados que permitan concluir si hubo incidencias."
+            )
 
     conversational_answer = capability_response(question, history)
     if conversational_answer:
@@ -3562,7 +4581,14 @@ def chat_event():
             normalized_business_text(question),
         ):
             original_chart_planner_sql = deterministic_planner_week_load_sql(question, history)
-        sql = original_chart_planner_sql or make_sql(analytical_question, schema, history)
+        original_breakdown_sql = deterministic_availability_breakdown_sql(question, history)
+        sql = (
+            original_chart_planner_sql
+            or original_breakdown_sql
+            or make_sql(analytical_question, schema, history)
+        )
+        if original_breakdown_sql:
+            logging.info("Desglose de disponibilidad enrutado desde la pregunta original")
         if original_chart_planner_sql:
             logging.info("Consulta gráfica de capacidad enrutada desde la pregunta original")
         if sql == "NO_SE_PUEDE":
@@ -3609,7 +4635,9 @@ def chat_event():
             if remaining_error:
                 raise ValueError(remaining_error)
             rows = execute_query(sql)
-        answer = deterministic_oee_target_savings_answer(rows)
+        answer = deterministic_availability_breakdown_answer(question, rows, sql, history)
+        if answer is None:
+            answer = deterministic_oee_target_savings_answer(rows)
         if answer is None:
             answer = deterministic_high_volume_opportunity_answer(analytical_question, rows)
         if answer is None:
@@ -3617,9 +4645,13 @@ def chat_event():
         if answer is None:
             answer = deterministic_balance_answer(rows)
         if answer is None:
+            answer = deterministic_planner_comparison_answer(
+                analytical_question, rows, sql, history
+            )
+        if answer is None:
             answer = deterministic_planner_answer(analytical_question, rows)
         if answer is None:
-            answer = explain(question, rows, history, sql)
+            answer = explain(analytical_question, rows, history, sql)
         answer = append_text_chart(answer, question, rows)
         answer = append_calculation_trace(answer, analytical_question, rows, sql, history)
         return remembered_response(answer)
